@@ -1,0 +1,250 @@
+name: Temporary ChatGPT YouTube transcript fetch
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fetch:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.issue.title == '[chatgpt] fetch qvI-TY2W1RM') ||
+      (github.event_name == 'issue_comment' && github.event.comment.body == '/chatgpt-fetch-qvi')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      VIDEO_ID: qvI-TY2W1RM
+      VIDEO_URL: https://www.youtube.com/watch?v=qvI-TY2W1RM
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install retrieval tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp youtube-transcript-api requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Retrieve metadata, captions, or audio
+        shell: bash
+        run: |
+          set +e
+          mkdir -p transcript-output
+          exec > >(tee transcript-output/run.log) 2>&1
+          echo "Started at $(date -u +%FT%TZ)"
+          yt-dlp --version
+
+          curl -L --retry 3 --max-time 30 \
+            "https://noembed.com/embed?url=${VIDEO_URL}" \
+            -o transcript-output/noembed.json || true
+
+          echo '=== yt-dlp metadata/caption attempts ==='
+          for CLIENTS in \
+            'web,web_safari,android_vr,ios' \
+            'android,ios' \
+            'mweb,web_safari' \
+            'tv,web'; do
+            echo "Trying clients: $CLIENTS"
+            yt-dlp --no-playlist --ignore-no-formats-error \
+              --extractor-args "youtube:player_client=${CLIENTS}" \
+              --write-info-json --skip-download \
+              --write-subs --write-auto-subs \
+              --sub-langs 'de.*,en.*,es.*,fr.*,it.*,pt.*,nl.*,pl.*,tr.*,ru.*,ja.*,ko.*,zh.*,ar.*' \
+              --sub-format 'vtt/json3/best' \
+              -o 'transcript-output/%(id)s.%(ext)s' "$VIDEO_URL" && break
+          done
+
+          yt-dlp --no-playlist --list-subs "$VIDEO_URL" \
+            > transcript-output/list-subs.txt 2>&1 || true
+
+          echo '=== youtube-transcript-api attempt ==='
+          python - <<'PY'
+          import json, pathlib, traceback
+          out = pathlib.Path('transcript-output')
+          video_id = 'qvI-TY2W1RM'
+          try:
+              from youtube_transcript_api import YouTubeTranscriptApi
+              api = YouTubeTranscriptApi()
+              transcripts = list(api.list(video_id))
+              meta = []
+              for t in transcripts:
+                  meta.append({
+                      'language': getattr(t, 'language', None),
+                      'language_code': getattr(t, 'language_code', None),
+                      'is_generated': getattr(t, 'is_generated', None),
+                      'is_translatable': getattr(t, 'is_translatable', None),
+                  })
+              (out/'youtube-transcript-api-languages.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+              prefs = ['de', 'de-DE', 'de-AT', 'de-CH', 'en', 'en-US', 'en-GB']
+              def rank(t):
+                  code = getattr(t, 'language_code', '') or ''
+                  try: p = prefs.index(code)
+                  except ValueError:
+                      p = 100 if code.split('-')[0] not in ('de','en') else 20
+                  return (p, bool(getattr(t, 'is_generated', False)))
+              chosen = sorted(transcripts, key=rank)[0]
+              fetched = chosen.fetch()
+              rows = []
+              for s in fetched:
+                  rows.append({'text': s.text, 'start': float(s.start), 'duration': float(s.duration)})
+              payload = {
+                  'video_id': video_id,
+                  'language': getattr(chosen, 'language', None),
+                  'language_code': getattr(chosen, 'language_code', None),
+                  'is_generated': getattr(chosen, 'is_generated', None),
+                  'segments': rows,
+              }
+              (out/'youtube-transcript-api.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+              (out/'youtube-transcript-api.txt').write_text('\n'.join(x['text'] for x in rows), encoding='utf-8')
+              print('youtube-transcript-api succeeded:', len(rows), 'segments')
+          except Exception:
+              (out/'youtube-transcript-api-error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              traceback.print_exc()
+          PY
+
+          HAS_TEXT=$(find transcript-output -maxdepth 1 -type f \( -name '*.vtt' -o -name '*transcript*.json' -o -name '*transcript*.txt' \) ! -name '*error*' -size +100c | head -n 1)
+          if [ -z "$HAS_TEXT" ]; then
+            echo '=== No captions found; attempting audio download ==='
+            for CLIENTS in \
+              'android_vr,ios,web_safari,web' \
+              'android,ios' \
+              'mweb,web_safari' \
+              'tv,web'; do
+              yt-dlp --no-playlist \
+                --extractor-args "youtube:player_client=${CLIENTS}" \
+                -f 'bestaudio[ext=m4a]/bestaudio/best' \
+                -o 'transcript-output/audio.%(ext)s' "$VIDEO_URL" && break
+            done
+          fi
+
+          if ! find transcript-output -maxdepth 1 -type f -name 'audio.*' | grep -q . && [ -z "$HAS_TEXT" ]; then
+            echo '=== Trying Piped/Invidious audio fallbacks ==='
+            python - <<'PY'
+          import json, pathlib, requests, traceback
+          out = pathlib.Path('transcript-output')
+          vid = 'qvI-TY2W1RM'
+          apis = [
+              f'https://pipedapi.kavin.rocks/streams/{vid}',
+              f'https://pipedapi.adminforge.de/streams/{vid}',
+              f'https://pipedapi.reallyaweso.me/streams/{vid}',
+              f'https://pipedapi.r4fo.com/streams/{vid}',
+              f'https://yewtu.be/api/v1/videos/{vid}',
+              f'https://inv.nadeko.net/api/v1/videos/{vid}',
+              f'https://invidious.nerdvpn.de/api/v1/videos/{vid}',
+          ]
+          log=[]
+          for api in apis:
+              try:
+                  r=requests.get(api,timeout=30,headers={'User-Agent':'Mozilla/5.0'})
+                  log.append({'api':api,'status':r.status_code,'head':r.text[:300]})
+                  if not r.ok: continue
+                  data=r.json()
+                  candidates=[]
+                  for x in data.get('audioStreams',[]):
+                      if x.get('url'): candidates.append((x.get('bitrate') or 0,x['url']))
+                  for x in data.get('adaptiveFormats',[]):
+                      typ=x.get('type') or x.get('mimeType') or ''
+                      if typ.startswith('audio') and x.get('url'):
+                          candidates.append((x.get('bitrate') or 0,x['url']))
+                  if not candidates: continue
+                  url=sorted(candidates,reverse=True)[0][1]
+                  with requests.get(url,stream=True,timeout=90,headers={'User-Agent':'Mozilla/5.0'}) as rr:
+                      rr.raise_for_status()
+                      path=out/'audio-fallback.bin'
+                      with path.open('wb') as f:
+                          for chunk in rr.iter_content(1024*1024):
+                              if chunk: f.write(chunk)
+                  if path.stat().st_size > 10000:
+                      print('Downloaded fallback audio from',api,path.stat().st_size)
+                      break
+              except Exception as e:
+                  log.append({'api':api,'error':repr(e),'trace':traceback.format_exc()[-1000:]})
+          (out/'fallback-api-log.json').write_text(json.dumps(log,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          fi
+
+          HAS_TEXT=$(find transcript-output -maxdepth 1 -type f \( -name '*.vtt' -o -name '*transcript*.json' -o -name '*transcript*.txt' \) ! -name '*error*' -size +100c | head -n 1)
+          AUDIO=$(find transcript-output -maxdepth 1 -type f \( -name 'audio.*' -o -name 'audio-fallback.bin' \) -size +10000c | head -n 1)
+          if [ -z "$HAS_TEXT" ] && [ -n "$AUDIO" ]; then
+            echo "=== Transcribing audio with faster-whisper: $AUDIO ==="
+            python -m pip install --upgrade faster-whisper
+            python - <<'PY'
+          import json, pathlib, os, traceback
+          out=pathlib.Path('transcript-output')
+          audio_files=[p for p in out.iterdir() if (p.name.startswith('audio.') or p.name=='audio-fallback.bin') and p.stat().st_size>10000]
+          if not audio_files:
+              raise SystemExit('No audio file')
+          audio=str(audio_files[0])
+          try:
+              from faster_whisper import WhisperModel
+              model=WhisperModel('small', device='cpu', compute_type='int8')
+              segments, info=model.transcribe(audio, beam_size=5, vad_filter=True)
+              rows=[]
+              for s in segments:
+                  rows.append({'start':float(s.start),'end':float(s.end),'text':s.text.strip()})
+              payload={'language':info.language,'language_probability':info.language_probability,'segments':rows}
+              (out/'whisper-transcript.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'whisper-transcript.txt').write_text('\n'.join(x['text'] for x in rows),encoding='utf-8')
+              def ts(sec):
+                  ms=round(sec*1000); h,ms=divmod(ms,3600000); m,ms=divmod(ms,60000); s,ms=divmod(ms,1000)
+                  return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
+              lines=['WEBVTT','']
+              for i,x in enumerate(rows,1):
+                  lines += [str(i),f"{ts(x['start'])} --> {ts(x['end'])}",x['text'],'']
+              (out/'whisper-transcript.vtt').write_text('\n'.join(lines),encoding='utf-8')
+              print('Whisper succeeded:',len(rows),'segments',info.language,info.language_probability)
+          except Exception:
+              (out/'whisper-error.txt').write_text(traceback.format_exc(),encoding='utf-8')
+              raise
+          PY
+          fi
+
+          rm -f transcript-output/audio.* transcript-output/audio-fallback.bin
+          echo "Finished retrieval at $(date -u +%FT%TZ)"
+          find transcript-output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Return files through issue comments
+        if: always() && github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, gzip, io, json, os, pathlib, tarfile
+          root=pathlib.Path('transcript-output')
+          issue=os.environ.get('ISSUE_NUMBER','')
+          if not issue:
+              raise SystemExit('No issue number')
+          files=[p for p in root.glob('*') if p.is_file()]
+          manifest={p.name:p.stat().st_size for p in files}
+          with tarfile.open('/tmp/transcript-output.tar.gz','w:gz') as tf:
+              for p in files: tf.add(p,arcname=p.name)
+          data=base64.b64encode(pathlib.Path('/tmp/transcript-output.tar.gz').read_bytes()).decode()
+          chunk=42000
+          parts=[data[i:i+chunk] for i in range(0,len(data),chunk)] or ['']
+          pathlib.Path('/tmp/status.md').write_text(
+              'ChatGPT transcript retrieval finished.\n\n'
+              f'Files: `{json.dumps(manifest,ensure_ascii=False)}`\n\n'
+              f'Encoded archive parts: **{len(parts)}**.',encoding='utf-8')
+          for i,part in enumerate(parts,1):
+              body=f'CHATGPT_ARTIFACT_QVI_PART {i}/{len(parts)}\n\n```text\n{part}\n```\n'
+              pathlib.Path(f'/tmp/part-{i}.md').write_text(body,encoding='utf-8')
+          pathlib.Path('/tmp/part-count').write_text(str(len(parts)))
+          PY
+          gh issue comment "$ISSUE_NUMBER" --body-file /tmp/status.md
+          COUNT=$(cat /tmp/part-count)
+          for i in $(seq 1 "$COUNT"); do
+            gh issue comment "$ISSUE_NUMBER" --body-file "/tmp/part-${i}.md"
+          done
