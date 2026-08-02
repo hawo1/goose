@@ -1,0 +1,93 @@
+name: ChatGPT fetch YouTube qvI-TY2W1RM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/chatgpt-fetch-youtube-qvi-trigger.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VIDEO_URL: https://www.youtube.com/watch?v=qvI-TY2W1RM
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: |
+          python -m pip install -U yt-dlp youtube-transcript-api requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+      - name: Fetch transcript or audio
+        shell: bash
+        run: |
+          set +e
+          mkdir -p transcript-output
+          exec > >(tee transcript-output/run.log) 2>&1
+          curl -L --retry 3 --max-time 30 "https://noembed.com/embed?url=${VIDEO_URL}" -o transcript-output/noembed.json || true
+          yt-dlp --no-playlist --ignore-no-formats-error --write-info-json --skip-download \
+            --write-subs --write-auto-subs --sub-langs 'de.*,en.*,es.*' --sub-format 'vtt/json3/best' \
+            --extractor-args 'youtube:player_client=web,web_safari,android_vr,ios,android,mweb,tv' \
+            -o 'transcript-output/%(id)s.%(ext)s' "$VIDEO_URL" || true
+          yt-dlp --no-playlist --list-subs "$VIDEO_URL" > transcript-output/list-subs.txt 2>&1 || true
+          python - <<'PY'
+          import json,pathlib,traceback
+          out=pathlib.Path('transcript-output'); vid='qvI-TY2W1RM'
+          try:
+              from youtube_transcript_api import YouTubeTranscriptApi
+              api=YouTubeTranscriptApi(); ts=list(api.list(vid))
+              (out/'languages.json').write_text(json.dumps([{'language':t.language,'language_code':t.language_code,'generated':t.is_generated} for t in ts],ensure_ascii=False,indent=2),encoding='utf-8')
+              pref=['de','de-DE','en','en-US','es']
+              def rank(t):
+                  try:r=pref.index(t.language_code)
+                  except ValueError:r=50
+                  return (r,t.is_generated)
+              t=sorted(ts,key=rank)[0]; seg=t.fetch()
+              rows=[{'text':s.text,'start':float(s.start),'duration':float(s.duration)} for s in seg]
+              (out/'api-transcript.json').write_text(json.dumps({'language':t.language,'language_code':t.language_code,'segments':rows},ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'api-transcript.txt').write_text('\n'.join(x['text'] for x in rows),encoding='utf-8')
+          except Exception:
+              (out/'api-error.txt').write_text(traceback.format_exc(),encoding='utf-8')
+          PY
+          HAS=$(find transcript-output -type f \( -name '*.vtt' -o -name '*transcript*.json' -o -name '*transcript*.txt' \) ! -name '*error*' -size +100c | head -1)
+          if [ -z "$HAS" ]; then
+            yt-dlp --no-playlist -f 'bestaudio[ext=m4a]/bestaudio/best' \
+              --extractor-args 'youtube:player_client=android_vr,ios,web_safari,web,android,mweb,tv' \
+              -o 'transcript-output/audio.%(ext)s' "$VIDEO_URL" || true
+          fi
+          AUDIO=$(find transcript-output -type f -name 'audio.*' -size +10000c | head -1)
+          if [ -z "$HAS" ] && [ -n "$AUDIO" ]; then
+            python -m pip install -U faster-whisper
+            python - <<'PY'
+          import json,pathlib,traceback
+          out=pathlib.Path('transcript-output'); audio=next(p for p in out.glob('audio.*') if p.stat().st_size>10000)
+          try:
+              from faster_whisper import WhisperModel
+              model=WhisperModel('small',device='cpu',compute_type='int8')
+              seg,info=model.transcribe(str(audio),beam_size=5,vad_filter=True)
+              rows=[{'start':float(s.start),'end':float(s.end),'text':s.text.strip()} for s in seg]
+              (out/'whisper-transcript.json').write_text(json.dumps({'language':info.language,'segments':rows},ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'whisper-transcript.txt').write_text('\n'.join(x['text'] for x in rows),encoding='utf-8')
+          except Exception:
+              (out/'whisper-error.txt').write_text(traceback.format_exc(),encoding='utf-8')
+          PY
+          fi
+          rm -f transcript-output/audio.*
+          find transcript-output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+      - name: Upload transcript output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qvI-TY2W1RM-transcript-output
+          path: transcript-output
+          if-no-files-found: error
+          retention-days: 1
