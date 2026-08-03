@@ -1,0 +1,169 @@
+name: Temporary ChatGPT video extraction 1CdhJxtTdYo
+
+on:
+  pull_request:
+    paths:
+      - chatgpt-video-1Cdh-trigger.txt
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install retrieval tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp youtube-transcript-api requests
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Retrieve metadata, captions, or audio transcript
+        shell: bash
+        run: |
+          set +e
+          mkdir -p video-output
+          exec > >(tee video-output/run.log) 2>&1
+          URL='https://www.youtube.com/watch?v=1CdhJxtTdYo'
+
+          echo '=== noembed metadata ==='
+          curl -L --retry 3 --max-time 30 \
+            "https://noembed.com/embed?url=${URL}" \
+            -o video-output/noembed.json || true
+
+          echo '=== yt-dlp metadata and subtitle attempts ==='
+          for CLIENTS in \
+            'web,web_safari,android_vr,ios' \
+            'android,ios' \
+            'mweb,web_safari' \
+            'tv,web'; do
+            echo "Trying clients: ${CLIENTS}"
+            yt-dlp --no-playlist --ignore-no-formats-error \
+              --extractor-args "youtube:player_client=${CLIENTS}" \
+              --write-info-json --skip-download \
+              --write-subs --write-auto-subs \
+              --sub-langs 'de.*,en.*,es.*,fr.*,it.*,pt.*,nl.*' \
+              --sub-format 'json3/vtt/best' \
+              -o 'video-output/%(id)s.%(ext)s' "$URL" && break
+          done
+
+          yt-dlp --no-playlist --list-subs "$URL" \
+            > video-output/list-subs.txt 2>&1 || true
+
+          echo '=== youtube-transcript-api ==='
+          python - <<'PY'
+          import json, pathlib, traceback
+          out = pathlib.Path('video-output')
+          video_id = '1CdhJxtTdYo'
+          try:
+              from youtube_transcript_api import YouTubeTranscriptApi
+              api = YouTubeTranscriptApi()
+              transcripts = list(api.list(video_id))
+              meta = []
+              for t in transcripts:
+                  meta.append({
+                      'language': t.language,
+                      'language_code': t.language_code,
+                      'is_generated': t.is_generated,
+                      'is_translatable': t.is_translatable,
+                  })
+              (out/'transcript-languages.json').write_text(
+                  json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+              prefs = ['de', 'de-DE', 'de-AT', 'de-CH', 'en', 'en-US', 'en-GB', 'es']
+              def rank(t):
+                  try:
+                      p = prefs.index(t.language_code)
+                  except ValueError:
+                      p = 50
+                  return (p, bool(t.is_generated))
+              chosen = sorted(transcripts, key=rank)[0]
+              rows = [
+                  {'text': s.text, 'start': float(s.start), 'duration': float(s.duration)}
+                  for s in chosen.fetch()
+              ]
+              payload = {
+                  'video_id': video_id,
+                  'language': chosen.language,
+                  'language_code': chosen.language_code,
+                  'is_generated': chosen.is_generated,
+                  'segments': rows,
+              }
+              (out/'api-transcript.json').write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+              (out/'api-transcript.txt').write_text(
+                  '\n'.join(x['text'] for x in rows), encoding='utf-8')
+              print('Transcript API succeeded:', len(rows), 'segments')
+          except Exception:
+              (out/'transcript-api-error.txt').write_text(
+                  traceback.format_exc(), encoding='utf-8')
+              traceback.print_exc()
+          PY
+
+          HAS_TRANSCRIPT=$(find video-output -maxdepth 1 -type f \( -name '*.json3' -o -name '*.vtt' -o -name '*transcript*.json' -o -name '*transcript*.txt' \) ! -name '*error*' -size +200c | head -n 1)
+
+          if [ -z "$HAS_TRANSCRIPT" ]; then
+            echo '=== No public transcript; trying audio ==='
+            for CLIENTS in \
+              'android_vr,ios,web_safari,web' \
+              'android,ios' \
+              'mweb,web_safari' \
+              'tv,web'; do
+              echo "Audio clients: ${CLIENTS}"
+              yt-dlp --no-playlist \
+                --extractor-args "youtube:player_client=${CLIENTS}" \
+                -f 'bestaudio[ext=m4a]/bestaudio/best' \
+                -o 'video-output/audio.%(ext)s' "$URL" && break
+            done
+          fi
+
+          AUDIO=$(find video-output -maxdepth 1 -type f -name 'audio.*' -size +10000c | head -n 1)
+          if [ -z "$HAS_TRANSCRIPT" ] && [ -n "$AUDIO" ]; then
+            echo "=== Whisper transcription: ${AUDIO} ==="
+            python -m pip install --upgrade faster-whisper
+            python - <<'PY'
+          import json, pathlib, traceback
+          out = pathlib.Path('video-output')
+          audio = next(p for p in out.glob('audio.*') if p.stat().st_size > 10000)
+          try:
+              from faster_whisper import WhisperModel
+              model = WhisperModel('small', device='cpu', compute_type='int8')
+              segments, info = model.transcribe(str(audio), beam_size=5, vad_filter=True)
+              rows = [
+                  {'start': float(s.start), 'end': float(s.end), 'text': s.text.strip()}
+                  for s in segments
+              ]
+              payload = {
+                  'language': info.language,
+                  'language_probability': info.language_probability,
+                  'segments': rows,
+              }
+              (out/'whisper-transcript.json').write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+              (out/'whisper-transcript.txt').write_text(
+                  '\n'.join(x['text'] for x in rows), encoding='utf-8')
+              print('Whisper succeeded:', len(rows), 'segments')
+          except Exception:
+              (out/'whisper-error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+              traceback.print_exc()
+          PY
+          fi
+
+          rm -f video-output/audio.*
+          find video-output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Upload extraction output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-1CdhJxtTdYo-data
+          path: video-output
+          if-no-files-found: error
+          retention-days: 1
